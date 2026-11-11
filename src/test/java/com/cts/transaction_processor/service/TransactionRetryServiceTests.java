@@ -13,10 +13,7 @@ import org.junit.jupiter.api.Test;
 import com.cts.transaction_processor.model.Transaction;
 import com.cts.transaction_processor.model.TransactionStatus;
 import com.cts.transaction_processor.model.TransactionType;
-import com.cts.transaction_processor.repository.AccountRepository;
-import com.cts.transaction_processor.repository.IdempotencyRepository;
-import com.cts.transaction_processor.repository.IdempotencyRepository.RetryState;
-import com.cts.transaction_processor.repository.TransactionRepository;
+import com.cts.transaction_processor.service.IdempotencyService.RetryState;
 
 import jakarta.validation.Validation;
 import jakarta.validation.ValidatorFactory;
@@ -37,12 +34,14 @@ class TransactionRetryServiceTests {
 
 	@Test
 	void retriesSimulatedFailureAndProcessesTheBalanceOnce() {
-		AccountRepository accounts = accountRepository();
-		IdempotencyRepository idempotencyRepository = new IdempotencyRepository();
-		TransactionRepository transactionRepository = new TransactionRepository();
+		TestPersistence.Context persistence = persistence();
+		var accounts = persistence.accounts();
+		var idempotencyRepository = persistence.idempotency();
+		var transactionRepository = persistence.transactions();
 		AtomicInteger attempts = new AtomicInteger();
 		IdempotencyService executor = new IdempotencyService(
 				idempotencyRepository,
+				persistence.requests(),
 				accounts,
 				transactionRepository,
 				new TransactionValidationService(validatorFactory.getValidator()),
@@ -65,22 +64,24 @@ class TransactionRetryServiceTests {
 		assertEquals(TransactionStatus.PROCESSED, transaction.getStatus());
 		assertEquals(2, attempts.get());
 		assertEquals(IdempotencyResult.Status.DUPLICATE_TRANSACTION, duplicate.status());
-		RetryState retryState = idempotencyRepository.findRetryState("TXN-2005").orElseThrow();
+		RetryState retryState = executor.findRetryState("TXN-2005").orElseThrow();
 		assertEquals(TransactionStatus.PROCESSED, retryState.status());
 		assertEquals(1, retryState.retryCount());
 		assertEquals(TransactionStatus.PROCESSED,
 				transactionRepository.findById("TXN-2005").orElseThrow().getStatus());
-		assertEquals(new BigDecimal("110.00"), accounts.findBalance("account-1").orElseThrow());
+		assertEquals(new BigDecimal("110.00"), TestPersistence.balance(accounts, "account-1"));
 	}
 
 	@Test
 	void permanentValidationErrorsAreNotRetried() {
-		AccountRepository accounts = accountRepository();
-		IdempotencyRepository idempotencyRepository = new IdempotencyRepository();
-		TransactionRepository transactionRepository = new TransactionRepository();
+		TestPersistence.Context persistence = persistence();
+		var accounts = persistence.accounts();
+		var idempotencyRepository = persistence.idempotency();
+		var transactionRepository = persistence.transactions();
 		AtomicInteger attempts = new AtomicInteger();
 		IdempotencyService executor = new IdempotencyService(
 				idempotencyRepository,
+				persistence.requests(),
 				accounts,
 				transactionRepository,
 				new TransactionValidationService(validatorFactory.getValidator()),
@@ -100,18 +101,20 @@ class TransactionRetryServiceTests {
 		assertEquals(0, result.retryCount());
 		assertEquals(0, attempts.get());
 		assertEquals(TransactionStatus.INVALID,
-				idempotencyRepository.findRetryState("TXN-INVALID").orElseThrow().status());
-		assertEquals(new BigDecimal("100.00"), accounts.findBalance("account-1").orElseThrow());
+				executor.findRetryState("TXN-INVALID").orElseThrow().status());
+		assertEquals(new BigDecimal("100.00"), TestPersistence.balance(accounts, "account-1"));
 	}
 
 	@Test
 	void marksTransactionFailedAfterThreeRetriesAreExhausted() {
-		AccountRepository accounts = accountRepository();
-		IdempotencyRepository idempotencyRepository = new IdempotencyRepository();
-		TransactionRepository transactionRepository = new TransactionRepository();
+		TestPersistence.Context persistence = persistence();
+		var accounts = persistence.accounts();
+		var idempotencyRepository = persistence.idempotency();
+		var transactionRepository = persistence.transactions();
 		java.util.concurrent.atomic.AtomicInteger attempts = new java.util.concurrent.atomic.AtomicInteger();
 		IdempotencyService executor = new IdempotencyService(
 				idempotencyRepository,
+				persistence.requests(),
 				accounts,
 				transactionRepository,
 				new TransactionValidationService(validatorFactory.getValidator()),
@@ -131,16 +134,16 @@ class TransactionRetryServiceTests {
 		assertEquals("Simulated persistent downstream timeout", result.failureReason());
 		assertEquals(TransactionRetryService.MAX_RETRIES + 1, attempts.get());
 		assertEquals(TransactionStatus.FAILED,
-				idempotencyRepository.findRetryState("TXN-EXHAUST").orElseThrow().status());
+				executor.findRetryState("TXN-EXHAUST").orElseThrow().status());
 		assertEquals(TransactionStatus.FAILED,
 				transactionRepository.findById("TXN-EXHAUST").orElseThrow().getStatus());
-		assertEquals(new BigDecimal("100.00"), accounts.findBalance("account-1").orElseThrow());
+		assertEquals(new BigDecimal("100.00"), TestPersistence.balance(accounts, "account-1"));
 	}
 
-	private static AccountRepository accountRepository() {
-		AccountRepository accounts = new AccountRepository();
-		accounts.saveBalance("account-1", new BigDecimal("100.00"));
-		return accounts;
+	private static TestPersistence.Context persistence() {
+		TestPersistence.Context persistence = TestPersistence.create();
+		TestPersistence.saveAccount(persistence.accounts(), "account-1", new BigDecimal("100.00"));
+		return persistence;
 	}
 
 	private static Transaction transaction(String transactionId) {

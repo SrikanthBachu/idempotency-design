@@ -45,6 +45,15 @@ public class TransactionRetryService {
 					String failureReason = String.join("; ", result.errors());
 					transactionExecutor.recordRetryState(transaction, TransactionStatus.INVALID, failureReason);
 					return withAttemptState(result, transaction.getStatus(), retryCount, failureReason);
+				} else if (result.status() == IdempotencyResult.Status.FAILED
+						|| result.status() == IdempotencyResult.Status.CONFLICT
+						|| result.status() == IdempotencyResult.Status.REJECTED) {
+					transaction.setStatus(TransactionStatus.FAILED);
+					String failureReason = result.failureReason() != null
+							? result.failureReason()
+							: result.errors().isEmpty() ? result.message() : String.join("; ", result.errors());
+					transactionExecutor.recordRetryState(transaction, TransactionStatus.FAILED, failureReason);
+					return withAttemptState(result, transaction.getStatus(), retryCount, failureReason);
 				}
 				return withAttemptState(result, transaction.getStatus(), retryCount, null);
 			}

@@ -4,19 +4,23 @@ import java.math.BigDecimal;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.TreeSet;
 
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import com.cts.transaction_processor.api.dto.TransactionStatusDto;
 import com.cts.transaction_processor.api.dto.TransactionSummaryDto;
 import com.cts.transaction_processor.model.Transaction;
 import com.cts.transaction_processor.model.TransactionStatus;
+import com.cts.transaction_processor.model.Account;
 import com.cts.transaction_processor.repository.AccountRepository;
-import com.cts.transaction_processor.repository.IdempotencyRepository;
-import com.cts.transaction_processor.repository.IdempotencyRepository.RetryState;
 import com.cts.transaction_processor.repository.TransactionRepository;
 import com.cts.transaction_processor.repository.TransactionResultRepository;
 import com.cts.transaction_processor.service.IdempotencyResult;
+import com.cts.transaction_processor.service.IdempotencyService;
+import com.cts.transaction_processor.service.IdempotencyService.RetryState;
 import com.cts.transaction_processor.service.SequenceExecution;
 import com.cts.transaction_processor.service.SequenceProcessingResult;
 import com.cts.transaction_processor.service.SequenceProcessingResult.Status;
@@ -29,7 +33,7 @@ public class TransactionApiService {
 	private final TransactionProcessor processor;
 	private final TransactionRepository transactionRepository;
 	private final AccountRepository accountRepository;
-	private final IdempotencyRepository idempotencyRepository;
+	private final IdempotencyService idempotencyService;
 	private final TransactionRetryService retryService;
 	private final TransactionResultRepository resultRepository;
 
@@ -37,13 +41,13 @@ public class TransactionApiService {
 			TransactionProcessor processor,
 			TransactionRepository transactionRepository,
 			AccountRepository accountRepository,
-			IdempotencyRepository idempotencyRepository,
+			IdempotencyService idempotencyService,
 			TransactionRetryService retryService,
 			TransactionResultRepository resultRepository) {
 		this.processor = processor;
 		this.transactionRepository = transactionRepository;
 		this.accountRepository = accountRepository;
-		this.idempotencyRepository = idempotencyRepository;
+		this.idempotencyService = idempotencyService;
 		this.retryService = retryService;
 		this.resultRepository = resultRepository;
 	}
@@ -51,9 +55,6 @@ public class TransactionApiService {
 	public TransactionStatusDto findTransaction(String transactionId) {
 		Transaction transaction = transactionRepository.findById(transactionId)
 				.orElseThrow(() -> new ResourceNotFoundException("Transaction not found: " + transactionId));
-		String failureReason = idempotencyRepository.findRetryState(transactionId)
-				.map(RetryState::failureReason)
-				.orElseGet(() -> failureReasonFor(transaction));
 		return new TransactionStatusDto(
 				transaction.getTransactionId(),
 				transaction.getAccountId(),
@@ -63,15 +64,11 @@ public class TransactionApiService {
 				transaction.getCurrency(),
 				transaction.getStatus(),
 				transaction.getRetryCount(),
-				failureReason);
+				transaction.getFailureReason());
 	}
 
 	public SequenceProcessingResult process(Transaction transaction) {
-		if (hasTransactionId(transaction)
-				&& transactionRepository.findById(transaction.getTransactionId()).isEmpty()) {
-			transaction.setStatus(TransactionStatus.RECEIVED);
-			transactionRepository.saveOrUpdate(transaction);
-		}
+		acceptTransaction(transaction);
 
 		SequenceProcessingResult result = processor.process(transaction);
 		for (SequenceExecution execution : result.executions()) {
@@ -80,10 +77,11 @@ public class TransactionApiService {
 					: transactionRepository.findById(execution.transactionId()).orElse(null);
 			if (stored != null) {
 				stored.setStatus(statusOf(execution));
+				stored.setFailureReason(failureReasonOf(execution));
 				if (execution.executionResult() != null) {
 					stored.setRetryCount(execution.executionResult().retryCount());
 				}
-				transactionRepository.saveOrUpdate(stored);
+				transactionRepository.save(stored);
 			}
 		}
 		if (hasTransactionId(transaction) && result.executions().stream()
@@ -92,34 +90,76 @@ public class TransactionApiService {
 			Transaction stored = transactionRepository.findById(transaction.getTransactionId()).orElse(null);
 			if (stored != null) {
 				stored.setStatus(TransactionStatus.FAILED);
-				transactionRepository.saveOrUpdate(stored);
+				stored.setFailureReason(result.errors().isEmpty()
+						? result.message()
+						: String.join("; ", result.errors()));
+				transactionRepository.save(stored);
 			}
 		}
 		return result;
+	}
+
+	@Transactional
+	public void acceptBatch(List<Transaction> transactions) {
+		TreeSet<String> accountIds = new TreeSet<>();
+		for (Transaction transaction : transactions) {
+			if (transaction != null && transaction.getAccountId() != null
+					&& !transaction.getAccountId().isBlank()) {
+				accountIds.add(transaction.getAccountId());
+			}
+		}
+		for (String accountId : accountIds) {
+			accountRepository.findByIdForUpdate(accountId);
+		}
+		for (Transaction transaction : transactions) {
+			acceptTransaction(transaction);
+		}
+	}
+
+	private synchronized void acceptTransaction(Transaction transaction) {
+		if (!hasTransactionId(transaction)) {
+			return;
+		}
+		Transaction requestWithSameId = transaction.getRequestId() == null
+				? null
+				: transactionRepository.findByRequestId(transaction.getRequestId()).orElse(null);
+		if (requestWithSameId != null && !sameRequestPayload(requestWithSameId, transaction)) {
+			throw new ConflictException("requestId is already associated with a different request");
+		}
+		Transaction existing = transactionRepository.findById(transaction.getTransactionId()).orElse(null);
+		if (existing != null) {
+			if (!sameBusinessPayload(existing, transaction)) {
+				throw new ConflictException(
+						"transactionId is already associated with a different payload");
+			}
+			return;
+		}
+		transaction.setStatus(TransactionStatus.RECEIVED);
+		transactionRepository.saveAndFlush(transaction);
+	}
+
+	private static boolean sameRequestPayload(Transaction first, Transaction second) {
+		return first.getTransactionId().equals(second.getTransactionId())
+				&& sameBusinessPayload(first, second);
+	}
+
+	private static boolean sameBusinessPayload(Transaction first, Transaction second) {
+		return Objects.equals(first.getAccountId(), second.getAccountId())
+				&& Objects.equals(first.getOriginalTransactionId(), second.getOriginalTransactionId())
+				&& first.getTransactionType() == second.getTransactionType()
+				&& sameAmount(first.getAmount(), second.getAmount())
+				&& Objects.equals(first.getCurrency(), second.getCurrency())
+				&& first.getSequenceNumber() == second.getSequenceNumber();
+	}
+
+	private static boolean sameAmount(BigDecimal first, BigDecimal second) {
+		return first == null ? second == null : second != null && first.compareTo(second) == 0;
 	}
 
 	private static boolean hasTransactionId(Transaction transaction) {
 		return transaction != null
 				&& transaction.getTransactionId() != null
 				&& !transaction.getTransactionId().isBlank();
-	}
-
-	private String failureReasonFor(Transaction transaction) {
-		if (transaction.getAccountId() == null || transaction.getAccountId().isBlank()
-				|| transaction.getSequenceNumber() <= 0) {
-			return null;
-		}
-		return processor.findExecution(transaction.getAccountId(), transaction.getSequenceNumber())
-				.map(execution -> {
-					if (execution.terminalInvalid()) {
-						return String.join("; ", execution.errors());
-					}
-					return execution.executionResult() != null
-							&& execution.executionResult().status() == IdempotencyResult.Status.FAILED
-							? execution.executionResult().failureReason()
-							: null;
-				})
-				.orElse(null);
 	}
 
 	private static boolean isTerminalFailure(Status status) {
@@ -131,7 +171,8 @@ public class TransactionApiService {
 	}
 
 	public BigDecimal findBalance(String accountId) {
-		return accountRepository.findBalance(accountId)
+		return accountRepository.findById(accountId)
+				.map(Account::getBalance)
 				.orElseThrow(() -> new ResourceNotFoundException("Account not found: " + accountId));
 	}
 
@@ -140,29 +181,36 @@ public class TransactionApiService {
 		for (TransactionStatus status : TransactionStatus.values()) {
 			counts.put(status, 0L);
 		}
-		List<Transaction> transactions = transactionRepository.findAll();
-		for (Transaction transaction : transactions) {
-			if (transaction.getStatus() != null) {
-				counts.compute(transaction.getStatus(), (status, count) -> count + 1);
-			}
+		long total = 0;
+		for (TransactionRepository.StatusCount statusCount : transactionRepository.countGroupedByStatus()) {
+			counts.put(statusCount.getStatus(), statusCount.getTransactionCount());
+			total += statusCount.getTransactionCount();
 		}
-		return new TransactionSummaryDto(transactions.size(), counts);
+		return new TransactionSummaryDto(total, counts);
 	}
 
+	@Transactional
 	public SequenceProcessingResult retryFailed(String transactionId) {
 		Transaction transaction = transactionRepository.findById(transactionId)
 				.orElseThrow(() -> new ResourceNotFoundException("Transaction not found: " + transactionId));
-		RetryState retryState = idempotencyRepository.findRetryState(transactionId)
+		RetryState retryState = idempotencyService.findRetryState(transactionId)
 				.orElseThrow(() -> new ConflictException("Transaction is not eligible for retry"));
 		if (transaction.getStatus() != TransactionStatus.FAILED
-				|| retryState.status() != TransactionStatus.FAILED) {
+				|| retryState.status() != TransactionStatus.FAILED
+				|| retryState.retryCount() < TransactionRetryService.MAX_RETRIES) {
 			throw new ConflictException("Only transactions that exhausted transient retries can be retried");
 		}
 
 		transaction.setStatus(TransactionStatus.PENDING);
 		transaction.setRetryCount(0);
-		transactionRepository.saveOrUpdate(transaction);
+		transactionRepository.save(transaction);
 		IdempotencyResult retryResult = retryService.process(transaction);
+		if (retryResult.status() == IdempotencyResult.Status.DUPLICATE_REQUEST
+				|| retryResult.status() == IdempotencyResult.Status.DUPLICATE_TRANSACTION) {
+			transaction.setStatus(TransactionStatus.PROCESSED);
+			transaction.setFailureReason(null);
+			transactionRepository.save(transaction);
+		}
 		SequenceExecution execution = new SequenceExecution(
 				transaction.getSequenceNumber(),
 				transaction.getTransactionId(),
@@ -205,5 +253,20 @@ public class TransactionApiService {
 			case DUPLICATE_REQUEST, DUPLICATE_TRANSACTION -> TransactionStatus.DUPLICATE;
 			case TRANSIENT_FAILURE, FAILED, INVALID, CONFLICT, REJECTED -> TransactionStatus.FAILED;
 		};
+	}
+
+	private static String failureReasonOf(SequenceExecution execution) {
+		if (execution.terminalInvalid()) {
+			return String.join("; ", execution.errors());
+		}
+		if (execution.executionResult() == null) {
+			return null;
+		}
+		if (execution.executionResult().failureReason() != null) {
+			return execution.executionResult().failureReason();
+		}
+		return execution.executionResult().errors().isEmpty()
+				? null
+				: String.join("; ", execution.executionResult().errors());
 	}
 }

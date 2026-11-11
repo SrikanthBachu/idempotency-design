@@ -32,6 +32,7 @@ public class TransactionBatchService {
 		List<Transaction> transactions = requests.stream()
 				.map(request -> request == null ? null : request.toTransaction())
 				.toList();
+		transactionApiService.acceptBatch(transactions);
 		String batchId = UUID.randomUUID().toString();
 		batchExecutor.execute(() -> processBatch(batchId, transactions));
 		return batchId;

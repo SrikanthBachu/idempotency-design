@@ -7,20 +7,24 @@ import java.util.Optional;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import com.cts.transaction_processor.model.Transaction;
 import com.cts.transaction_processor.model.TransactionStatus;
 import com.cts.transaction_processor.model.TransactionType;
+import com.cts.transaction_processor.model.Account;
+import com.cts.transaction_processor.model.IdempotencyRecord;
+import com.cts.transaction_processor.model.RequestIdempotencyRecord;
 import com.cts.transaction_processor.repository.AccountRepository;
 import com.cts.transaction_processor.repository.IdempotencyRepository;
+import com.cts.transaction_processor.repository.RequestIdempotencyRecordJpaRepository;
 import com.cts.transaction_processor.repository.TransactionRepository;
-import com.cts.transaction_processor.repository.IdempotencyRepository.ProcessedTransaction;
-import com.cts.transaction_processor.repository.IdempotencyRepository.RequestRecord;
 
 @Service
 public class IdempotencyService {
 
 	private final IdempotencyRepository idempotencyRepository;
+	private final RequestIdempotencyRecordJpaRepository requestRepository;
 	private final AccountRepository accountRepository;
 	private final TransactionRepository transactionRepository;
 	private final TransactionValidationService validationService;
@@ -28,10 +32,12 @@ public class IdempotencyService {
 
 	@Autowired
 	public IdempotencyService(IdempotencyRepository idempotencyRepository,
+			RequestIdempotencyRecordJpaRepository requestRepository,
 			AccountRepository accountRepository, TransactionRepository transactionRepository,
 			TransactionValidationService validationService, TransientFailureSimulator failureSimulator) {
 		this.idempotencyRepository = Objects.requireNonNull(idempotencyRepository,
 				"idempotencyRepository must not be null");
+		this.requestRepository = Objects.requireNonNull(requestRepository, "requestRepository must not be null");
 		this.accountRepository = Objects.requireNonNull(accountRepository, "accountRepository must not be null");
 		this.transactionRepository = Objects.requireNonNull(transactionRepository,
 				"transactionRepository must not be null");
@@ -39,6 +45,7 @@ public class IdempotencyService {
 		this.failureSimulator = Objects.requireNonNull(failureSimulator, "failureSimulator must not be null");
 	}
 
+	@Transactional
 	public synchronized IdempotencyResult process(Transaction request) {
 		Transaction transaction = request == null ? null : copyOf(request);
 		TransactionValidationResult validation = validationService.validate(transaction);
@@ -47,85 +54,117 @@ public class IdempotencyService {
 					validation.errors());
 		}
 
-		Optional<ProcessedTransaction> previousTransaction =
-				idempotencyRepository.findTransaction(transaction.getTransactionId());
-		if (previousTransaction.isPresent()
-				&& !sameBusinessPayload(previousTransaction.get().transaction(), transaction)) {
+		Optional<Transaction> acceptedTransaction = transactionRepository.findById(transaction.getTransactionId());
+		if (acceptedTransaction.isPresent()
+				&& !sameBusinessPayload(acceptedTransaction.get(), transaction)) {
 			return result(IdempotencyResult.Status.CONFLICT,
 					"transactionId is already associated with a different payload", null, List.of());
 		}
 
-		Optional<RequestRecord> previousRequest = idempotencyRepository.findRequest(transaction.getRequestId());
+		Optional<IdempotencyRecord> previousTransaction =
+				idempotencyRepository.findById(transaction.getTransactionId());
+		if (previousTransaction.isPresent()
+				&& !sameBusinessPayload(previousTransaction.get().getTransaction(), transaction)) {
+			return result(IdempotencyResult.Status.CONFLICT,
+					"transactionId is already associated with a different payload", null, List.of());
+		}
+
+		Optional<RequestIdempotencyRecord> previousRequest =
+				requestRepository.findById(transaction.getRequestId());
 		if (previousRequest.isPresent()) {
-			if (sameRequestPayload(previousRequest.get().transaction(), transaction)) {
-				ProcessedTransaction processed = idempotencyRepository
-						.findTransaction(previousRequest.get().transaction().getTransactionId())
+			if (sameRequestPayload(previousRequest.get().getTransaction(), transaction)) {
+				IdempotencyRecord processed = idempotencyRepository
+						.findById(previousRequest.get().getTransaction().getTransactionId())
 						.orElseThrow(() -> new IllegalStateException("Recorded request has no processed transaction"));
 				return result(IdempotencyResult.Status.DUPLICATE_REQUEST,
-						"requestId has already been processed", processed.balanceAfter(), List.of());
+						"requestId has already been processed", processed.getBalanceAfter(), List.of());
 			}
 			return result(IdempotencyResult.Status.CONFLICT,
 					"requestId is already associated with a different request", null, List.of());
 		}
 
+		Optional<Transaction> acceptedRequest = transactionRepository.findByRequestId(transaction.getRequestId());
+		if (acceptedRequest.isPresent()
+				&& !sameRequestPayload(acceptedRequest.get(), transaction)) {
+			return result(IdempotencyResult.Status.CONFLICT,
+					"requestId is already associated with a different request", null, List.of());
+		}
+
 		if (previousTransaction.isPresent()) {
-			ProcessedTransaction processed = previousTransaction.get();
-			idempotencyRepository.recordRequest(transaction.getRequestId(), transaction);
+			IdempotencyRecord processed = previousTransaction.get();
+			requestRepository.save(new RequestIdempotencyRecord(
+					transaction.getRequestId(), processed.getTransaction()));
 			return result(IdempotencyResult.Status.DUPLICATE_TRANSACTION,
 					"transactionId has already been processed; the existing balance change was not repeated",
-					processed.balanceAfter(), List.of());
+					processed.getBalanceAfter(), List.of());
 		}
 
 		BigDecimal balanceDelta;
 		if (transaction.getTransactionType() == TransactionType.REVERSAL) {
-			Optional<ProcessedTransaction> original = idempotencyRepository
-					.findTransaction(transaction.getOriginalTransactionId());
+			Optional<IdempotencyRecord> original =
+					idempotencyRepository.findById(transaction.getOriginalTransactionId());
 			if (original.isEmpty()) {
 				return result(IdempotencyResult.Status.REJECTED,
 						"originalTransactionId does not identify a processed transaction", null, List.of());
 			}
-			ProcessedTransaction originalTransaction = original.get();
-			if (!transaction.getAccountId().equals(originalTransaction.transaction().getAccountId())
-					|| transaction.getAmount().compareTo(originalTransaction.balanceDelta().abs()) != 0) {
+			IdempotencyRecord originalTransaction = original.get();
+			if (!transaction.getAccountId().equals(originalTransaction.getTransaction().getAccountId())
+					|| transaction.getAmount().compareTo(originalTransaction.getBalanceDelta().abs()) != 0) {
 				return result(IdempotencyResult.Status.CONFLICT,
 						"reversal accountId and amount must match the original transaction", null, List.of());
 			}
-			if (idempotencyRepository.isReversed(transaction.getOriginalTransactionId())) {
+			if (originalTransaction.isReversed()
+					|| idempotencyRepository.findByReversedTransactionId(
+							transaction.getOriginalTransactionId()).isPresent()) {
 				return result(IdempotencyResult.Status.CONFLICT,
 						"original transaction has already been reversed", null, List.of());
 			}
-			balanceDelta = originalTransaction.balanceDelta().negate();
+			balanceDelta = originalTransaction.getBalanceDelta().negate();
 		} else {
 			balanceDelta = transaction.getTransactionType() == TransactionType.CREDIT
 					? transaction.getAmount()
 					: transaction.getAmount().negate();
 		}
 
-		if (accountRepository.findBalance(transaction.getAccountId()).isEmpty()) {
+		if (!accountRepository.existsById(transaction.getAccountId())) {
 			return result(IdempotencyResult.Status.REJECTED, "accountId does not identify an existing account",
 					null, List.of(), transaction.getStatus(), transaction.getRetryCount(), null);
 		}
 
-		transactionRepository.saveOrUpdate(transaction);
+		transactionRepository.save(transaction);
 		String failureReason = failureSimulator.failureReason(transaction, transaction.getRetryCount());
 		if (failureReason != null) {
 			return result(IdempotencyResult.Status.TRANSIENT_FAILURE, failureReason, null,
 					List.of(failureReason), transaction.getStatus(), transaction.getRetryCount(), failureReason);
 		}
 
-		BigDecimal balanceAfter = accountRepository.adjustBalance(transaction.getAccountId(), balanceDelta);
+		Account account = accountRepository.findByIdForUpdate(transaction.getAccountId())
+				.orElseThrow(() -> new IllegalStateException(
+						"Account does not exist: " + transaction.getAccountId()));
+		BigDecimal balanceAfter = account.getBalance().add(balanceDelta);
+		account.setBalance(balanceAfter);
 		try {
 			transaction.setStatus(TransactionStatus.PROCESSED);
-			transactionRepository.saveOrUpdate(transaction);
-			idempotencyRepository.recordProcessed(transaction, balanceDelta, balanceAfter,
-					transaction.getRequestId(),
+			transaction.setFailureReason(null);
+			transactionRepository.save(transaction);
+			if (idempotencyRepository.existsById(transaction.getTransactionId())) {
+				throw new IllegalStateException("Transaction already recorded: " + transaction.getTransactionId());
+			}
+			if (requestRepository.existsById(transaction.getRequestId())) {
+				throw new IllegalStateException("Request already recorded: " + transaction.getRequestId());
+			}
+			idempotencyRepository.save(new IdempotencyRecord(
+					transaction,
+					balanceDelta,
+					balanceAfter,
 					transaction.getTransactionType() == TransactionType.REVERSAL
-							? transaction.getOriginalTransactionId() : null);
+							? transaction.getOriginalTransactionId() : null));
+			requestRepository.save(new RequestIdempotencyRecord(transaction.getRequestId(), transaction));
 		} catch (RuntimeException exception) {
-			accountRepository.adjustBalance(transaction.getAccountId(), balanceDelta.negate());
+			account.setBalance(account.getBalance().subtract(balanceDelta));
 			transaction.setStatus(TransactionStatus.PROCESSING);
 			try {
-				transactionRepository.saveOrUpdate(transaction);
+				transactionRepository.save(transaction);
 			} catch (RuntimeException restoreException) {
 				exception.addSuppressed(restoreException);
 			}
@@ -135,8 +174,23 @@ public class IdempotencyService {
 	}
 
 	public void recordRetryState(Transaction transaction, TransactionStatus status, String failureReason) {
-		idempotencyRepository.recordRetryState(transaction, status, failureReason);
-		transactionRepository.saveOrUpdate(transaction);
+		transaction.setStatus(status);
+		transaction.setFailureReason(failureReason);
+		transactionRepository.save(transaction);
+	}
+
+	public Optional<RetryState> findRetryState(String transactionId) {
+		return transactionRepository.findById(transactionId)
+				.filter(transaction -> transaction.getRetryCount() > 0
+						|| transaction.getFailureReason() != null
+						|| transaction.getStatus() == TransactionStatus.FAILED
+						|| transaction.getStatus() == TransactionStatus.INVALID
+						|| transaction.getStatus() == TransactionStatus.RETRY_PENDING)
+				.map(transaction -> new RetryState(
+						transaction,
+						transaction.getStatus(),
+						transaction.getRetryCount(),
+						transaction.getFailureReason()));
 	}
 
 	private static boolean sameRequestPayload(Transaction first, Transaction second) {
@@ -154,7 +208,7 @@ public class IdempotencyService {
 	}
 
 	private static Transaction copyOf(Transaction transaction) {
-		return new Transaction(
+		Transaction copy = new Transaction(
 				transaction.getTransactionId(),
 				transaction.getRequestId(),
 				transaction.getAccountId(),
@@ -167,6 +221,8 @@ public class IdempotencyService {
 				transaction.getRetryCount(),
 				transaction.getCreatedAt(),
 				transaction.getUpdatedAt());
+		copy.setFailureReason(transaction.getFailureReason());
+		return copy;
 	}
 
 	private static IdempotencyResult result(IdempotencyResult.Status status, String message,
@@ -179,5 +235,12 @@ public class IdempotencyService {
 			com.cts.transaction_processor.model.TransactionStatus transactionStatus,
 			int retryCount, String failureReason) {
 		return new IdempotencyResult(status, message, balance, errors, transactionStatus, retryCount, failureReason);
+	}
+
+	public record RetryState(
+			Transaction transaction,
+			TransactionStatus status,
+			int retryCount,
+			String failureReason) {
 	}
 }

@@ -41,15 +41,18 @@ class SequenceProcessingServiceTests {
 
 	@BeforeEach
 	void createService() {
-		accountRepository = new AccountRepository();
-		accountRepository.saveBalance("account-1", new BigDecimal("100.00"));
+		TestPersistence.Context persistence = TestPersistence.create();
+		accountRepository = persistence.accounts();
+		TestPersistence.saveAccount(accountRepository, "account-1", new BigDecimal("100.00"));
 		TransactionValidationService validationService =
 				new TransactionValidationService(validatorFactory.getValidator());
 		IdempotencyService idempotencyService = new IdempotencyService(
-				new IdempotencyRepository(), accountRepository, new TransactionRepository(), validationService,
+				persistence.idempotency(), persistence.requests(), accountRepository,
+				persistence.transactions(), validationService,
 				(transaction, retryCount) -> null);
 		TransactionRetryService executionService = new TransactionRetryService(idempotencyService);
-		sequenceProcessingService = new SequenceProcessingService(validationService, executionService);
+		sequenceProcessingService = new SequenceProcessingService(
+				validationService, executionService, persistence.transactions());
 	}
 
 	@Test
@@ -61,7 +64,7 @@ class SequenceProcessingServiceTests {
 		assertEquals(List.of(2L), sequence2.pendingSequences());
 		assertEquals(List.of(new SequenceGap(1, 1)), sequence2.missingSequences());
 		assertTrue(sequence2.executions().isEmpty());
-		assertEquals(new BigDecimal("100.00"), accountRepository.findBalance("account-1").orElseThrow());
+		assertEquals(new BigDecimal("100.00"), TestPersistence.balance(accountRepository, "account-1"));
 
 		SequenceProcessingResult sequence1 = sequenceProcessingService.submit(
 				transaction(1, "txn-1", "100.00", TransactionType.CREDIT));
@@ -73,7 +76,7 @@ class SequenceProcessingServiceTests {
 		assertEquals(new BigDecimal("160.00"), sequence1.executions().get(1).executionResult().balance());
 		assertTrue(sequence1.pendingSequences().isEmpty());
 		assertTrue(sequence1.missingSequences().isEmpty());
-		assertEquals(new BigDecimal("160.00"), accountRepository.findBalance("account-1").orElseThrow());
+		assertEquals(new BigDecimal("160.00"), TestPersistence.balance(accountRepository, "account-1"));
 	}
 
 	@Test
@@ -82,7 +85,7 @@ class SequenceProcessingServiceTests {
 
 		assertEquals(SequenceProcessingResult.Status.BUFFERED, sequence3.status());
 		assertEquals(List.of(new SequenceGap(1, 2)), sequence3.missingSequences());
-		assertEquals(new BigDecimal("100.00"), accountRepository.findBalance("account-1").orElseThrow());
+		assertEquals(new BigDecimal("100.00"), TestPersistence.balance(accountRepository, "account-1"));
 
 		SequenceProcessingResult sequence1 = sequenceProcessingService.submit(transaction(1, "txn-1", "10.00"));
 
@@ -101,7 +104,7 @@ class SequenceProcessingServiceTests {
 				.map(SequenceExecution::sequenceNumber).toList());
 		assertTrue(sequence2.executions().get(0).terminalInvalid());
 		assertFalse(sequence2.executions().get(1).terminalInvalid());
-		assertEquals(new BigDecimal("140.00"), accountRepository.findBalance("account-1").orElseThrow());
+		assertEquals(new BigDecimal("140.00"), TestPersistence.balance(accountRepository, "account-1"));
 	}
 
 	@Test
@@ -113,7 +116,7 @@ class SequenceProcessingServiceTests {
 
 		assertEquals(SequenceProcessingResult.Status.PROCESSED, first.status());
 		assertEquals(SequenceProcessingResult.Status.DUPLICATE, duplicate.status());
-		assertEquals(new BigDecimal("110.00"), accountRepository.findBalance("account-1").orElseThrow());
+		assertEquals(new BigDecimal("110.00"), TestPersistence.balance(accountRepository, "account-1"));
 	}
 
 	@Test
@@ -138,7 +141,7 @@ class SequenceProcessingServiceTests {
 		assertEquals(3, pending.get(0).getSequenceNumber());
 		assertTrue(recovery.executions().isEmpty());
 		assertEquals(List.of(new SequenceGap(1, 2)), recovery.missingSequences());
-		assertEquals(new BigDecimal("100.00"), accountRepository.findBalance("account-1").orElseThrow());
+		assertEquals(new BigDecimal("100.00"), TestPersistence.balance(accountRepository, "account-1"));
 	}
 
 	private static Transaction transaction(long sequence, String transactionId, String amount) {

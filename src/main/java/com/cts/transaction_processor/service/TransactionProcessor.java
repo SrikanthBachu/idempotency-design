@@ -133,6 +133,7 @@ public class TransactionProcessor {
 				transaction.getRetryCount(),
 				transaction.getCreatedAt(),
 				transaction.getUpdatedAt());
+		snapshot.setFailureReason(transaction.getFailureReason());
 		return snapshot;
 	}
 }

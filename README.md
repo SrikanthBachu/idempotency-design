@@ -4,9 +4,10 @@ A Spring Boot transaction-processing service that accepts transaction batches, v
 account sequence, prevents duplicate balance changes, retries simulated transient failures, and exposes processing
 status and account balances over REST.
 
-> **Assessment implementation:** repositories, sequence buffers, result records, and accounts are in-memory. This
-> project demonstrates the processing flow and concurrency controls; it is not a durable ledger or production banking
-> system.
+> **Assessment implementation:** accounts, transactions, and idempotency records use Spring Data JPA with an H2
+> in-memory database. Accepted transactions and sequence state are derived from persisted transaction rows;
+> submission results and the batch queue remain in memory. All database state
+> is lost when the application stops; this is not a durable ledger or production banking system.
 
 ## Problem statement
 
@@ -43,6 +44,10 @@ flowchart TD
     Retry --> Idempotency[Idempotency and transaction execution]
     Idempotency --> AccountRepo[Account repository]
     Idempotency --> TransactionRepo[Transaction repository]
+    AccountRepo --> H2[(H2 / Spring Data JPA)]
+    TransactionRepo --> H2
+    Idempotency --> IdemRepo[Idempotency repository]
+    IdemRepo --> H2
     Processor --> ResultRepo[Result repository]
     Controller --> Query[Status, balance, summary, retry queries]
     Query --> AccountRepo
@@ -54,12 +59,14 @@ The REST layer maps JSON DTOs to domain transactions. `TransactionProcessor` coo
 recording. `SequenceProcessingService` owns ordering and buffering; it invokes transaction execution only when the
 next expected sequence is present. `TransactionRetryService` owns attempt state and retry policy. `IdempotencyService`
 checks request and business keys, calculates balance deltas, and coordinates account and transaction state.
-Repositories isolate the in-memory storage implementation from the business services.
+Spring Data repositories persist accounts, transaction state, and idempotency records in H2; sequence and result
+repositories remain in memory.
 
 ## Technology stack
 
 - Java 17 language target
 - Spring Boot 4.2 snapshot, Spring MVC, and Jackson
+- Spring Data JPA, Hibernate, and H2
 - Jakarta Bean Validation
 - Maven Wrapper
 - JUnit 5 and Spring MVC test support
@@ -72,8 +79,8 @@ src/main/java/com/cts/transaction_processor/
 ├── TransactionProcessorApplication.java
 ├── api/                 # HTTP controllers, orchestration, errors, async executor
 │   └── dto/             # Request and response DTOs
-├── model/               # Transaction, type, and lifecycle status
-├── repository/          # In-memory account, transaction, idempotency, and result stores
+├── model/               # JPA entities, transaction type, and lifecycle status
+├── repository/          # Spring Data JPA repositories and in-memory result store
 └── service/             # Validation, sequencing, retries, execution, and processing
 
 src/test/java/com/cts/transaction_processor/
@@ -91,16 +98,20 @@ deduplication. `transactionId` identifies the business transaction: resubmitting
 request ID is a business-level duplicate and must not apply its balance delta again. Reusing the transaction ID with
 a different business payload is a conflict. An account/sequence slot is also protected from a second, different record.
 
-The implementation records accepted request IDs and completed transaction IDs in concurrent in-memory maps.
-Duplicate checks and balance mutation are synchronized in the idempotency service to prevent competing threads in this
-JVM from applying the same transaction twice. This does not enforce uniqueness across service instances or restarts.
+Processed business keys and request IDs are stored in the `transaction_idempotency` and `request_idempotency` tables;
+the business transaction is stored in `transactions`. Database primary/unique keys backstop the in-process synchronized
+idempotency service, while account balance changes use a pessimistic account-row lock inside a JPA transaction. This
+prevents duplicate updates against the same running database, but the configured H2 database is volatile and is not
+shared across service restarts or distributed deployments.
 
 ## Sequence ordering
 
 Sequence state is maintained separately for each account and begins at `1`. For example, sequence `2` submitted before
 sequence `1` is buffered and reports `1` as missing. Arrival of sequence `1` processes it first, then drains sequence
 `2`. Future records remain available through the service's pending-record and recovery methods until their gaps close.
-The sequence buffer is in memory and is not exposed as a REST endpoint.
+Pending and completed sequence positions are derived from persisted transaction rows, so ordering and pending-record
+recovery survive service-object recreation while the H2 database remains running. Sequence details are not exposed as
+a REST endpoint.
 
 Invalid records with a usable account ID and positive sequence number are terminal sequence entries. They return
 validation errors and advance the expected sequence; records without those identifiers cannot be ordered. The sequence
@@ -133,7 +144,7 @@ All endpoints are under `/api`.
 ### Submit a batch
 
 ```http
-POST /api/transactions/batch
+POST {{baseUrl}}/api/transactions/batch
 Content-Type: application/json
 ```
 
@@ -167,21 +178,23 @@ Content-Type: application/json
 
 ```json
 {
-  "batchId": "generated-uuid",
+  "batchId": "<server-generated UUID>",
   "status": "ACCEPTED",
   "acceptedCount": 1,
-  "acceptedAt": "2026-11-11T05:30:00Z",
+  "acceptedAt": "<server-generated ISO-8601 timestamp>",
   "message": "Batch accepted for background processing"
 }
 ```
 
-The batch worker processes records individually. Per-record outcomes are available through transaction status and the
-in-memory result store; there is currently no batch-status endpoint.
+`batchId` and `acceptedAt` are generated per call. `acceptedCount` is the submitted array size. This response means
+the rows were accepted and the batch was queued; it does not claim that background processing has completed. The
+worker processes records individually. Per-record outcomes are available through the transaction endpoint; there is
+no batch-status endpoint.
 
 ### Read transaction status
 
 ```http
-GET /api/transactions/TXN-2001
+GET {{baseUrl}}/api/transactions/TXN-2001
 ```
 
 ```json
@@ -198,12 +211,13 @@ GET /api/transactions/TXN-2001
 }
 ```
 
-Returns `404 Not Found` when the transaction is unknown.
+This response is serialized from the persisted `Transaction` row; amounts, state, retry count, and failure reason
+reflect H2 at read time. Returns `404 Not Found` when the transaction is unknown.
 
 ### Read an account balance
 
 ```http
-GET /api/accounts/ACC-201/balance
+GET {{baseUrl}}/api/accounts/ACC-201/balance
 ```
 
 ```json
@@ -213,12 +227,13 @@ GET /api/accounts/ACC-201/balance
 }
 ```
 
+The balance is read from the persisted account row and changes only when a unique business transaction commits.
 Returns `404 Not Found` if the account has not been initialized.
 
 ### Read transaction summary
 
 ```http
-GET /api/transactions/summary
+GET {{baseUrl}}/api/transactions/summary
 ```
 
 ```json
@@ -237,25 +252,67 @@ GET /api/transactions/summary
 }
 ```
 
+Counts are queried from persisted transaction rows when the request is handled. The example represents a database
+containing one `PROCESSED` transaction; live values vary with the contents of H2.
+
 ### Retry a failed transaction
 
 ```http
-POST /api/transactions/TXN-2005/retry
+POST {{baseUrl}}/api/transactions/TXN-2005/retry
 ```
 
-The response is a `SequenceProcessingResult`; a successful retry includes `"status": "PROCESSED"`. Unknown transaction
-IDs return `404 Not Found`; transactions not eligible for retry return `409 Conflict`.
-
-### Error response
-
-An empty batch or malformed request body returns `400 Bad Request`; missing resources return `404 Not Found`; attempting
-to retry an ineligible transaction returns `409 Conflict`; a full background queue returns `503 Service Unavailable`.
-Duplicate and payload-conflict outcomes are recorded per transaction during asynchronous processing and do not change
-the batch-acceptance response.
+Only a persisted `FAILED` transaction whose retry count exhausted the configured transient retry allowance is
+eligible. The handler returns `200 OK` with the actual `SequenceProcessingResult` shape:
 
 ```json
 {
-  "timestamp": "2026-11-11T05:30:00Z",
+  "accountId": "ACC-203",
+  "submittedSequence": 5,
+  "status": "PROCESSED",
+  "message": "Transaction processed",
+  "nextExpectedSequence": 6,
+  "missingSequences": [],
+  "pendingSequences": [],
+  "executions": [
+    {
+      "sequenceNumber": 5,
+      "transactionId": "TXN-2005",
+      "terminalInvalid": false,
+      "executionResult": {
+        "status": "PROCESSED",
+        "message": "Transaction processed",
+        "balance": 500.00,
+        "errors": [],
+        "transactionStatus": "PROCESSED",
+        "retryCount": 1,
+        "failureReason": null
+      },
+      "errors": []
+    }
+  ],
+  "errors": []
+}
+```
+
+For the example above, this assumes `ACC-203` starts with a zero balance; balance is read from the persisted account
+after the retry succeeds.
+
+This example shows the built-in `TXN-2005` transient failure on the initial retry attempt followed by success. The
+transaction status and retry count are persisted by the retry service; if the business idempotency record already
+exists, retry does not apply its balance delta again. Unknown transaction IDs return `404 Not Found`; transactions
+not eligible for retry return `409 Conflict`.
+
+The default batch simulator automatically retries `TXN-2005` and succeeds on its second attempt, so it does not
+naturally produce a transaction eligible for this manual-retry endpoint. The successful response above assumes the
+database already contains a `FAILED` transaction with its retry allowance exhausted.
+
+### Postman error responses
+
+The error DTO is consistent across routes. An empty batch returns `400 Bad Request`:
+
+```json
+{
+  "timestamp": "<server-generated ISO-8601 timestamp>",
   "status": 400,
   "error": "Bad Request",
   "message": "Request validation failed",
@@ -265,6 +322,48 @@ the batch-acceptance response.
   ]
 }
 ```
+
+Unknown transaction or account IDs return `404 Not Found`; for example, `GET {{baseUrl}}/api/transactions/missing`:
+
+```json
+{
+  "timestamp": "<server-generated ISO-8601 timestamp>",
+  "status": 404,
+  "error": "Not Found",
+  "message": "Transaction not found: missing",
+  "path": "/api/transactions/missing",
+  "details": []
+}
+```
+
+Reusing a transaction ID with a different payload returns `409 Conflict` from batch submission:
+
+```json
+{
+  "timestamp": "<server-generated ISO-8601 timestamp>",
+  "status": 409,
+  "error": "Conflict",
+  "message": "transactionId is already associated with a different payload",
+  "path": "/api/transactions/batch",
+  "details": []
+}
+```
+
+A retry request for a transaction that has not exhausted transient retries also returns `409 Conflict`:
+
+```json
+{
+  "timestamp": "<server-generated ISO-8601 timestamp>",
+  "status": 409,
+  "error": "Conflict",
+  "message": "Transaction is not eligible for retry",
+  "path": "/api/transactions/TXN-2001/retry",
+  "details": []
+}
+```
+
+`{{baseUrl}}` is a Postman environment variable, for example `http://localhost:8080`. Initialize accounts before
+submitting records; the application does not provide an account-creation route. A full async queue returns `503`.
 
 ## Run the application
 
@@ -298,6 +397,16 @@ sequence numbers have also been supplied or processed.
 .\mvnw.cmd test
 ```
 
+The Spring Boot JPA integration tests use a separate H2 database named
+`transaction-persistence-tests`; they verify persisted transaction acceptance, same-business-key duplicate handling,
+balance-once behavior, out-of-order sequencing, negative-amount rejection, the `TXN-2005` transient retry, persisted
+status and summary reads, and the database primary-key constraint. The REST tests also exercise the controller
+contracts. Run only the persistence integration tests with:
+
+```shell
+.\mvnw.cmd "-Dtest=TransactionJpaPersistenceTests" test
+```
+
 Tests cover transaction validation, invalid-record isolation, out-of-order sequence buffering/draining and missing
 sequence reporting, idempotency and concurrent duplicate requests, retry success/exhaustion/permanent validation
 errors, balance updates, transaction orchestration, and REST endpoint behavior.
@@ -307,22 +416,24 @@ errors, balance updates, transaction orchestration, and REST endpoint behavior.
 - Sequence numbers are contiguous and start at `1` **per account**.
 - A sequence-invalid record can only advance ordering if both account ID and positive sequence number are usable.
 - The sample application starts with no accounts; account balances must be created by an embedding system or test setup.
-- Currency codes are checked against ISO 4217, but account currency is not modeled and cross-currency conversion is not
-  supported.
+- Currency codes are checked against ISO 4217. Account currency is persisted, but the legacy
+  `saveBalance(accountId, balance)` method assumes USD; cross-currency conversion is not supported.
 - A reversal references a processed original transaction and applies the inverse delta once.
 - Debits are not constrained by an insufficient-funds rule; balances may become negative.
 - The transient failure is deterministic assessment scaffolding for `TXN-2005`.
-- In-memory collections prioritize a runnable assessment implementation over durability, distributed deployment, and
-  operational recovery.
+- H2 and remaining in-memory collections prioritize a runnable assessment implementation over durable storage,
+  distributed deployment, and operational recovery. Account, transaction, sequence, and idempotency state is stored
+  in H2; asynchronous batch work and submission/execution result indexing are not durable.
 
 ## Production hardening
 
 Before production use:
 
-1. Replace in-memory repositories and sequence buffers with a durable database. Atomically update account balances,
-   transaction status, idempotency keys, reversal markers, and processing results in one ACID transaction.
-2. Enforce unique constraints for `transactionId`, `requestId`, and `(accountId, sequenceNumber)`; use database locking
-   or optimistic version checks for concurrent workers and multiple service instances.
+1. Replace H2 in-memory storage with a durable database and move pending batch work and submission/execution results
+   into durable storage. Atomically update account balances, transaction status, idempotency keys, and reversal markers
+   in one ACID transaction.
+2. Enforce unique constraints for business `transactionId` and request keys. Coordinate account/sequence-slot claims
+   with database locking or a dedicated slot table, and use row locks or optimistic versions for concurrent workers.
 3. Persist pending sequences and retry metadata. Use a durable queue/outbox, retry scheduling with backoff and jitter,
    dead-letter handling, and restart recovery.
 4. Define account provisioning, currency ownership, debit limits/insufficient funds, reversal authorization, and

@@ -45,12 +45,14 @@ class IdempotencyServiceTests {
 
 	@BeforeEach
 	void createService() {
-		accountRepository = new AccountRepository();
-		accountRepository.saveBalance("account-1", new BigDecimal("100.00"));
+		TestPersistence.Context persistence = TestPersistence.create();
+		accountRepository = persistence.accounts();
+		TestPersistence.saveAccount(accountRepository, "account-1", new BigDecimal("100.00"));
 		idempotencyService = new IdempotencyService(
-				new IdempotencyRepository(),
+				persistence.idempotency(),
+				persistence.requests(),
 				accountRepository,
-				new TransactionRepository(),
+				persistence.transactions(),
 				new TransactionValidationService(validatorFactory.getValidator()),
 				(transaction, retryCount) -> null);
 	}
@@ -62,7 +64,7 @@ class IdempotencyServiceTests {
 
 		assertEquals(IdempotencyResult.Status.PROCESSED, first.status());
 		assertEquals(IdempotencyResult.Status.DUPLICATE_REQUEST, retry.status());
-		assertEquals(new BigDecimal("110.00"), accountRepository.findBalance("account-1").orElseThrow());
+		assertEquals(new BigDecimal("110.00"), TestPersistence.balance(accountRepository, "account-1"));
 	}
 
 	@Test
@@ -73,7 +75,7 @@ class IdempotencyServiceTests {
 				idempotencyService.process(transaction("txn-1", "request-2", "10.00"));
 
 		assertEquals(IdempotencyResult.Status.DUPLICATE_TRANSACTION, duplicate.status());
-		assertEquals(new BigDecimal("110.00"), accountRepository.findBalance("account-1").orElseThrow());
+		assertEquals(new BigDecimal("110.00"), TestPersistence.balance(accountRepository, "account-1"));
 	}
 
 	@Test
@@ -85,7 +87,7 @@ class IdempotencyServiceTests {
 
 		assertEquals(IdempotencyResult.Status.CONFLICT, conflict.status());
 		assertEquals("transactionId is already associated with a different payload", conflict.message());
-		assertEquals(new BigDecimal("110.00"), accountRepository.findBalance("account-1").orElseThrow());
+		assertEquals(new BigDecimal("110.00"), TestPersistence.balance(accountRepository, "account-1"));
 	}
 
 	@Test
@@ -119,7 +121,7 @@ class IdempotencyServiceTests {
 			assertEquals(1, statuses.stream().filter(status -> status == IdempotencyResult.Status.PROCESSED).count());
 			assertEquals(requestCount - 1L, statuses.stream()
 					.filter(status -> status == IdempotencyResult.Status.DUPLICATE_TRANSACTION).count());
-			assertEquals(new BigDecimal("110.00"), accountRepository.findBalance("account-1").orElseThrow());
+			assertEquals(new BigDecimal("110.00"), TestPersistence.balance(accountRepository, "account-1"));
 		} finally {
 			executor.shutdownNow();
 		}
@@ -138,7 +140,7 @@ class IdempotencyServiceTests {
 
 		assertEquals(IdempotencyResult.Status.PROCESSED, processed.status());
 		assertEquals(IdempotencyResult.Status.DUPLICATE_REQUEST, retry.status());
-		assertEquals(new BigDecimal("100.00"), accountRepository.findBalance("account-1").orElseThrow());
+		assertEquals(new BigDecimal("100.00"), TestPersistence.balance(accountRepository, "account-1"));
 	}
 
 	private static Transaction transaction(String transactionId, String requestId, String amount) {

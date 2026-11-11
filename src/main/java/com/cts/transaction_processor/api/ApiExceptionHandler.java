@@ -29,6 +29,13 @@ public class ApiExceptionHandler {
 		return error(HttpStatus.CONFLICT, exception.getMessage(), List.of(), request);
 	}
 
+	@ExceptionHandler(org.springframework.dao.DataIntegrityViolationException.class)
+	public ResponseEntity<ApiErrorDto> handlePersistenceConflict(
+			org.springframework.dao.DataIntegrityViolationException exception, WebRequest request) {
+		return error(HttpStatus.CONFLICT, "Transaction or request identifier is already in use",
+				List.of(), request);
+	}
+
 	@ExceptionHandler({MethodArgumentNotValidException.class, ConstraintViolationException.class})
 	public ResponseEntity<ApiErrorDto> handleValidation(Exception exception, WebRequest request) {
 		List<String> details;

@@ -1,63 +1,21 @@
 package com.cts.transaction_processor.repository;
 
-import java.math.BigDecimal;
-import java.util.Objects;
 import java.util.Optional;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 
-import org.springframework.stereotype.Repository;
+import jakarta.persistence.LockModeType;
 
-@Repository
-public class AccountRepository {
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
 
-	private final ConcurrentMap<String, BigDecimal> balances = new ConcurrentHashMap<>();
+import com.cts.transaction_processor.model.Account;
 
-	/**
-	 * Inserts or replaces an account's balance.
-	 */
-	public BigDecimal saveBalance(String accountId, BigDecimal balance) {
-		String key = requireKey(accountId, "accountId");
-		BigDecimal value = Objects.requireNonNull(balance, "balance must not be null");
-		balances.put(key, value);
-		return value;
-	}
+public interface AccountRepository extends JpaRepository<Account, String> {
 
-	public Optional<BigDecimal> findBalance(String accountId) {
-		return Optional.ofNullable(balances.get(requireKey(accountId, "accountId")));
-	}
+	Optional<Account> findByCurrency(String currency);
 
-	/**
-	 * Replaces the balance only when the account already exists.
-	 */
-	public BigDecimal updateBalance(String accountId, BigDecimal balance) {
-		String key = requireKey(accountId, "accountId");
-		BigDecimal value = Objects.requireNonNull(balance, "balance must not be null");
-		BigDecimal updated = balances.computeIfPresent(key, (ignored, current) -> value);
-		if (updated == null) {
-			throw new IllegalStateException("Account does not exist: " + key);
-		}
-		return updated;
-	}
-
-	/**
-	 * Atomically adds a delta to an existing account balance.
-	 */
-	public BigDecimal adjustBalance(String accountId, BigDecimal delta) {
-		String key = requireKey(accountId, "accountId");
-		BigDecimal adjustment = Objects.requireNonNull(delta, "delta must not be null");
-		BigDecimal updated = balances.computeIfPresent(key, (ignored, current) -> current.add(adjustment));
-		if (updated == null) {
-			throw new IllegalStateException("Account does not exist: " + key);
-		}
-		return updated;
-	}
-
-	private static String requireKey(String key, String name) {
-		Objects.requireNonNull(key, name + " must not be null");
-		if (key.isBlank()) {
-			throw new IllegalArgumentException(name + " must not be blank");
-		}
-		return key;
-	}
+	@Lock(LockModeType.PESSIMISTIC_WRITE)
+	@Query("select account from Account account where account.accountId = :accountId")
+	Optional<Account> findByIdForUpdate(@Param("accountId") String accountId);
 }

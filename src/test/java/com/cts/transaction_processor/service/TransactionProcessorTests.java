@@ -43,15 +43,17 @@ class TransactionProcessorTests {
 
 	@BeforeEach
 	void createProcessor() {
-		accounts = new AccountRepository();
-		accounts.saveBalance("account-1", new BigDecimal("100.00"));
-		transactions = new TransactionRepository();
+		TestPersistence.Context persistence = TestPersistence.create();
+		accounts = persistence.accounts();
+		TestPersistence.saveAccount(accounts, "account-1", new BigDecimal("100.00"));
+		transactions = persistence.transactions();
 		results = new TransactionResultRepository();
 		TransactionValidationService validation = new TransactionValidationService(validatorFactory.getValidator());
 		IdempotencyService idempotency = new IdempotencyService(
-				new IdempotencyRepository(), accounts, transactions, validation, new TransactionFailureSimulator());
+				persistence.idempotency(), persistence.requests(), accounts, transactions,
+				validation, new TransactionFailureSimulator());
 		SequenceProcessingService sequencing = new SequenceProcessingService(
-				validation, new TransactionRetryService(idempotency));
+				validation, new TransactionRetryService(idempotency), transactions);
 		processor = new TransactionProcessor(sequencing, results);
 	}
 
@@ -64,7 +66,7 @@ class TransactionProcessorTests {
 		assertEquals(SequenceProcessingResult.Status.BUFFERED, sequence3.status());
 		assertEquals(SequenceProcessingResult.Status.PROCESSED, sequence1.status());
 		assertEquals(SequenceProcessingResult.Status.INVALID, sequence2.status());
-		assertEquals(new BigDecimal("140.00"), accounts.findBalance("account-1").orElseThrow());
+		assertEquals(new BigDecimal("140.00"), TestPersistence.balance(accounts, "account-1"));
 		assertEquals(TransactionStatus.PROCESSED, transactions.findById("txn-1").orElseThrow().getStatus());
 		assertEquals(TransactionStatus.PROCESSED, transactions.findById("txn-3").orElseThrow().getStatus());
 		assertTrue(processor.findResultByRequestId("request-txn-2").isPresent());
@@ -93,7 +95,7 @@ class TransactionProcessorTests {
 
 		assertEquals(SequenceProcessingResult.Status.PROCESSED, creditResult.status());
 		assertEquals(SequenceProcessingResult.Status.DUPLICATE, duplicate.status());
-		assertEquals(new BigDecimal("95.00"), accounts.findBalance("account-1").orElseThrow());
+		assertEquals(new BigDecimal("95.00"), TestPersistence.balance(accounts, "account-1"));
 	}
 
 	@Test
@@ -109,7 +111,7 @@ class TransactionProcessorTests {
 		assertEquals(SequenceProcessingResult.Status.PROCESSED, results.get(0).status());
 		assertEquals(SequenceProcessingResult.Status.INVALID, results.get(1).status());
 		assertEquals(SequenceProcessingResult.Status.PROCESSED, results.get(2).status());
-		assertEquals(new BigDecimal("115.00"), accounts.findBalance("account-1").orElseThrow());
+		assertEquals(new BigDecimal("115.00"), TestPersistence.balance(accounts, "account-1"));
 		assertEquals(3, this.results.findAll().size());
 	}
 
@@ -122,7 +124,7 @@ class TransactionProcessorTests {
 		assertEquals(SequenceProcessingResult.Status.PROCESSED, result.status());
 		assertEquals(1, transactions.findById("TXN-2005").orElseThrow().getRetryCount());
 		assertEquals(TransactionStatus.PROCESSED, transactions.findById("TXN-2005").orElseThrow().getStatus());
-		assertEquals(new BigDecimal("110.00"), accounts.findBalance("account-1").orElseThrow());
+		assertEquals(new BigDecimal("110.00"), TestPersistence.balance(accounts, "account-1"));
 	}
 
 	private static Transaction credit(long sequence, String transactionId, String amount) {
