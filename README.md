@@ -379,17 +379,17 @@ Prerequisites: JDK 17 or newer. The Maven Wrapper downloads and uses the project
 ./mvnw spring-boot:run
 ```
 
-The HTTP server listens on port `8080` by default. Initialize accounts through the account repository before submitting
-transactions; this assessment implementation does not include an account-creation endpoint or seed account data.
+The HTTP server listens on port `8080` by default. At startup, the application seeds the sample INR accounts
+`ACC-201`, `ACC-202`, and `ACC-203` with opening balances of `1000.00`; no manual account setup is needed for the
+assessment batch. This can be disabled with `app.data.initialize=false`.
 
 ## CTS assessment sample
 
 [`transactions.json`](transactions.json) contains the six supplied sample records in arrival order, including the
 duplicate `TXN-2002`, the invalid negative amount on `TXN-2004`, and `TXN-2005` for transient retry simulation.
-Submit it as the body of `POST /api/transactions/batch`. The API accepts the batch asynchronously; to observe normal
-balance processing, initialize the sample accounts first. In particular, results also depend on each account's
-sequence stream starting at `1`. `TXN-2005` only reaches the transient-failure simulator if its account's preceding
-sequence numbers have also been supplied or processed.
+Submit it as the body of `POST /api/transactions/batch`. The API accepts the batch asynchronously. Results also
+depend on each account's sequence stream starting at `1`. `TXN-2005` only reaches the transient-failure simulator if
+its account's preceding sequence numbers have also been supplied or processed.
 
 ## Unit and integration tests
 
@@ -415,7 +415,10 @@ errors, balance updates, transaction orchestration, and REST endpoint behavior.
 
 - Sequence numbers are contiguous and start at `1` **per account**.
 - A sequence-invalid record can only advance ordering if both account ID and positive sequence number are usable.
-- The sample application starts with no accounts; account balances must be created by an embedding system or test setup.
+- On startup, `app.data.initialize=true` idempotently creates these sample accounts if they do not already exist:
+  `ACC-201`, `ACC-202`, and `ACC-203`, each in INR with an opening balance of `1000.00`. Existing account currency
+  and balances are left untouched. Set `app.data.initialize=false` to disable this sample data initialization.
+- No transaction records are initialized automatically; submit transactions through `POST /api/transactions/batch`.
 - Currency codes are checked against ISO 4217. Account currency is persisted, but the legacy
   `saveBalance(accountId, balance)` method assumes USD; cross-currency conversion is not supported.
 - A reversal references a processed original transaction and applies the inverse delta once.
